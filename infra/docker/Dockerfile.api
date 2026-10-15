@@ -1,0 +1,39 @@
+# syntax=docker/dockerfile:1
+FROM node:20-alpine AS base
+# openssl + libc6-compat are required by Prisma's musl query engine; without openssl present,
+# `prisma generate` can't detect the OpenSSL version and falls back to the wrong (1.1) engine.
+RUN apk add --no-cache openssl libc6-compat
+RUN corepack enable
+WORKDIR /repo
+
+FROM base AS deps
+COPY pnpm-workspace.yaml package.json pnpm-lock.yaml* ./
+COPY packages/shared-types/package.json packages/shared-types/package.json
+COPY apps/api/package.json apps/api/package.json
+RUN pnpm install --frozen-lockfile --filter @qennect/api...
+
+FROM deps AS build
+COPY packages/shared-types packages/shared-types
+COPY apps/api apps/api
+COPY tsconfig.base.json tsconfig.base.json
+RUN pnpm --filter @qennect/shared-types build
+RUN pnpm --filter @qennect/api prisma:generate
+RUN pnpm --filter @qennect/api build
+
+FROM node:20-alpine AS runtime
+RUN apk add --no-cache openssl libc6-compat
+RUN corepack enable
+WORKDIR /repo
+ENV NODE_ENV=production
+COPY --from=build /repo/pnpm-workspace.yaml /repo/package.json /repo/pnpm-lock.yaml ./
+COPY --from=build /repo/packages/shared-types/package.json packages/shared-types/package.json
+COPY --from=build /repo/packages/shared-types/dist packages/shared-types/dist
+COPY --from=build /repo/apps/api/package.json apps/api/package.json
+COPY --from=build /repo/apps/api/dist apps/api/dist
+COPY --from=build /repo/apps/api/generated apps/api/generated
+COPY --from=build /repo/apps/api/prisma apps/api/prisma
+RUN pnpm install --frozen-lockfile --prod --filter @qennect/api...
+
+WORKDIR /repo/apps/api
+EXPOSE 3000
+CMD ["node", "dist/main.js"]

@@ -1,0 +1,343 @@
+generator client {
+  provider = "prisma-client-js"
+  output   = "../generated/client"
+  // "native" covers local dev; the musl+OpenSSL 3 target is required for the node:20-alpine
+  // runtime image, which ships OpenSSL 3.x — without it Prisma generates an engine linked
+  // against libssl.so.1.1 and the container dies on boot.
+  binaryTargets = ["native", "linux-musl-openssl-3.0.x"]
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+enum TenantRole {
+  OWNER
+  ADMIN
+  MEMBER
+}
+
+enum ChannelType {
+  PUBLIC
+  PRIVATE
+  DM
+}
+
+enum ChannelMemberRole {
+  OWNER
+  ADMIN
+  MODERATOR
+  MEMBER
+}
+
+enum DevicePlatform {
+  IOS
+  ANDROID
+}
+
+/// EVERYONE: any member may post (default). ADMINS_ONLY: only channel ADMIN/OWNER (or a
+/// tenant community admin) may post — announcement-style channels; everyone else is read-only.
+enum ChannelPostingPolicy {
+  EVERYONE
+  ADMINS_ONLY
+}
+
+model Tenant {
+  id        String   @id @default(uuid())
+  slug      String   @unique
+  name      String
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  memberships TenantMembership[]
+  channels    Channel[]
+  messages    Message[]
+  sessions    Session[]
+  pushConfig  TenantPushConfig?
+
+  @@map("tenants")
+}
+
+/// Per-tenant Firebase Admin SDK credentials for push delivery — this is a white-label
+/// platform, so each tenant sends push through its own Firebase project, not a shared one.
+/// The service account is encrypted at rest (see SecretCipher) and only ever returned to the
+/// client as a status/projectId summary, never the plaintext secret, once set.
+model TenantPushConfig {
+  id                       String   @id @default(uuid())
+  tenantId                 String   @unique
+  /// AES-256-GCM ciphertext of the Firebase service-account JSON (iv:authTag:data, base64).
+  encryptedServiceAccount  String
+  /// Parsed out of the service account at set-time purely for display in admin UI/status
+  /// endpoints without ever decrypting the secret again.
+  projectId                String
+  createdAt                DateTime @default(now())
+  updatedAt                DateTime @updatedAt
+
+  tenant Tenant @relation(fields: [tenantId], references: [id], onDelete: Cascade)
+
+  @@map("tenant_push_configs")
+}
+
+/// A registered push token for one (user, device). A user can have several rows (phone +
+/// tablet, or a reinstalled app that got a new token) — tokens aren't deduped across devices,
+/// only exact-token upserts collapse (see DeviceTokensService.register).
+model DeviceToken {
+  id        String         @id @default(uuid())
+  tenantId  String
+  userId    String
+  token     String
+  platform  DevicePlatform
+  createdAt DateTime       @default(now())
+  updatedAt DateTime       @updatedAt
+
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@unique([tenantId, token])
+  @@index([tenantId, userId])
+  @@map("device_tokens")
+}
+
+model User {
+  /// For a self-registered (password) user this is a fresh uuid (the default). For a
+  /// federated user this is instead set explicitly to the external Qennect member id on
+  /// create — never a separately-minted id — so a chat user id is always identical to the
+  /// Qennect member id it belongs to, everywhere in the API (channel members, message
+  /// authorId, etc). See AuthService.federatedLogin.
+  id           String   @id @default(uuid())
+  email        String
+  /// Null for a federated user — they authenticate via Qennect, never a muchats password.
+  passwordHash String?
+  displayName  String
+  /// Platform-level flag, independent of any TenantMembership.role — grants access to
+  /// cross-tenant stats via the isolated `platform` module. Not settable via any tenant-scoped
+  /// endpoint; seeded/toggled directly for now (no self-service UI for granting it).
+  isSuperAdmin Boolean  @default(false)
+  createdAt    DateTime @default(now())
+  updatedAt    DateTime @updatedAt
+
+  memberships    TenantMembership[]
+  channelMembers ChannelMember[]
+  messages       Message[]
+  reactions      Reaction[]
+  readReceipts   ReadReceipt[]
+  sessions       Session[]
+  channelBans    ChannelBan[]       @relation("BannedUser")
+  mentions       MessageMention[]
+  deviceTokens   DeviceToken[]
+
+  // Same email can exist across tenants (multi-tenant identity), but must be
+  // unique within a tenant. Enforced via TenantMembership + this composite.
+  @@unique([email])
+  @@map("users")
+}
+
+/// A user's membership + role within one tenant. All tenant-scoped
+/// authorization is derived from this row.
+model TenantMembership {
+  id       String     @id @default(uuid())
+  tenantId String
+  userId   String
+  role     TenantRole @default(MEMBER)
+  joinedAt DateTime   @default(now())
+
+  tenant Tenant @relation(fields: [tenantId], references: [id], onDelete: Cascade)
+  user   User   @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@unique([tenantId, userId])
+  @@index([tenantId])
+  @@map("tenant_memberships")
+}
+
+model Session {
+  id           String    @id @default(uuid())
+  tenantId     String
+  userId       String
+  deviceName   String?
+  refreshToken String    @unique
+  createdAt    DateTime  @default(now())
+  expiresAt    DateTime
+  revokedAt    DateTime?
+
+  tenant Tenant @relation(fields: [tenantId], references: [id], onDelete: Cascade)
+  user   User   @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@index([tenantId, userId])
+  @@map("sessions")
+}
+
+model Channel {
+  id             String      @id @default(uuid())
+  tenantId       String
+  type           ChannelType
+  name           String?
+  /// Group profile — always null for a DM.
+  description    String?
+  avatarUrl      String?
+  /// Who may send messages in this channel. Enforced in MessagesService.send via
+  /// ChannelsService.assertCanPost. Always EVERYONE for a DM.
+  postingPolicy  ChannelPostingPolicy @default(EVERYONE)
+  createdAt      DateTime    @default(now())
+  lastMessageSeq BigInt      @default(0)
+  /// Denormalized preview of the latest surviving message, alongside lastMessageSeq — kept
+  /// current on send, and recomputed from the previous message when the latest one is
+  /// edited or deleted (see MessagesService). Null while the channel has no messages.
+  lastMessagePreview String?
+  /// Timestamp of the latest surviving message. Backs the channel-list "most recent activity
+  /// first" ordering; falls back to createdAt while null.
+  lastMessageAt      DateTime?
+
+  tenant   Tenant          @relation(fields: [tenantId], references: [id], onDelete: Cascade)
+  members  ChannelMember[]
+  messages Message[]
+  bans     ChannelBan[]
+
+  @@index([tenantId])
+  @@index([tenantId, lastMessageAt])
+  @@map("channels")
+}
+
+model ChannelMember {
+  id        String            @id @default(uuid())
+  tenantId  String
+  channelId String
+  userId    String
+  role      ChannelMemberRole @default(MEMBER)
+  /// Per-user, per-channel toggle, independent of role — silences notifications for this
+  /// member only.
+  muted     Boolean           @default(false)
+  joinedAt  DateTime          @default(now())
+
+  channel Channel @relation(fields: [channelId], references: [id], onDelete: Cascade)
+  user    User    @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@unique([channelId, userId])
+  @@index([tenantId, userId])
+  @@map("channel_members")
+}
+
+/// Persists independently of ChannelMember: banning a group member also deletes their
+/// ChannelMember row (kicked out), but banning in a DM ("block") leaves the 2-person
+/// membership alone — this row alone is what blocks sending in that case.
+model ChannelBan {
+  id             String   @id @default(uuid())
+  tenantId       String
+  channelId      String
+  userId         String
+  bannedByUserId String
+  createdAt      DateTime @default(now())
+
+  channel Channel @relation(fields: [channelId], references: [id], onDelete: Cascade)
+  user    User    @relation("BannedUser", fields: [userId], references: [id], onDelete: Cascade)
+
+  @@unique([channelId, userId])
+  @@index([tenantId, channelId])
+  @@map("channel_bans")
+}
+
+/// seq is assigned per-channel via a transactional increment on Channel.lastMessageSeq,
+/// giving strict monotonic ordering and a cheap cursor for pagination/reconnect-replay.
+/// clientMsgId + channelId is unique so retried sends are idempotent.
+model Message {
+  id          String    @id @default(uuid())
+  tenantId    String
+  channelId   String
+  authorId    String
+  clientMsgId String
+  seq         BigInt
+  body        String
+  parentId    String?
+  /// Inline "reply to this one message" — distinct from parentId (a thread reply). A quoted
+  /// reply stays in the main conversation flow with a preview of the quoted message attached;
+  /// a thread reply is filed away in its own view. Both can be set independently.
+  quotedMessageId String?
+  editedAt    DateTime?
+  deletedAt   DateTime?
+  createdAt   DateTime  @default(now())
+
+  tenant        Tenant            @relation(fields: [tenantId], references: [id], onDelete: Cascade)
+  channel       Channel           @relation(fields: [channelId], references: [id], onDelete: Cascade)
+  author        User              @relation(fields: [authorId], references: [id], onDelete: Cascade)
+  parent        Message?          @relation("ThreadReplies", fields: [parentId], references: [id], onDelete: SetNull)
+  replies       Message[]         @relation("ThreadReplies")
+  quotedMessage Message?          @relation("QuotedReplies", fields: [quotedMessageId], references: [id], onDelete: SetNull)
+  quotedBy      Message[]         @relation("QuotedReplies")
+  reactions     Reaction[]
+  attachments   Attachment[]
+  mentions      MessageMention[]
+
+  @@unique([channelId, clientMsgId])
+  @@unique([channelId, seq])
+  @@index([tenantId, channelId, seq])
+  @@index([parentId])
+  @@index([quotedMessageId])
+  @@map("messages")
+}
+
+/// The composer already knows which members it autocompleted via @-mention — no server-side
+/// text parsing needed. Stored for later use as push-notification targeting once that
+/// workstream starts; not consumed anywhere yet beyond being surfaced on MessageDto.
+model MessageMention {
+  id        String   @id @default(uuid())
+  messageId String
+  userId    String
+  createdAt DateTime @default(now())
+
+  message Message @relation(fields: [messageId], references: [id], onDelete: Cascade)
+  user    User    @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@unique([messageId, userId])
+  @@index([userId])
+  @@map("message_mentions")
+}
+
+model Reaction {
+  id        String   @id @default(uuid())
+  tenantId  String
+  messageId String
+  userId    String
+  emoji     String
+  createdAt DateTime @default(now())
+
+  message Message @relation(fields: [messageId], references: [id], onDelete: Cascade)
+  user    User    @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@unique([messageId, userId, emoji])
+  @@index([tenantId, messageId])
+  @@map("reactions")
+}
+
+/// One row per (channel, user): tracks the highest seq the user has read.
+/// seq is a plain counter value (0 = nothing read yet), intentionally not FK'd to
+/// Message so the baseline and post-delete seqs remain valid.
+model ReadReceipt {
+  id        String   @id @default(uuid())
+  tenantId  String
+  channelId String
+  userId    String
+  seq       BigInt   @default(0)
+  updatedAt DateTime @updatedAt
+
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@unique([channelId, userId])
+  @@index([tenantId, channelId])
+  @@map("read_receipts")
+}
+
+/// Attachment metadata only; binary lives in S3/R2 under key. Upload flow (Slice 2).
+model Attachment {
+  id        String   @id @default(uuid())
+  tenantId  String
+  messageId String?
+  storageKey String
+  fileName  String
+  mimeType  String
+  sizeBytes Int
+  createdAt DateTime @default(now())
+
+  message Message? @relation(fields: [messageId], references: [id], onDelete: SetNull)
+
+  @@index([tenantId])
+  @@map("attachments")
+}

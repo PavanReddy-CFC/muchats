@@ -1,0 +1,20 @@
+[Unit]
+Description=Qennect Chat — Admin Portal (Next.js)
+After=network.target
+
+[Service]
+Type=simple
+# Adjust to wherever the repo lives and whichever user should own the process.
+User=qennect
+WorkingDirectory=/opt/qennect-chat/apps/admin
+EnvironmentFile=/opt/qennect-chat/apps/admin/.env.production
+Environment=NODE_ENV=production
+Environment=PORT=3001
+ExecStart=/usr/bin/pnpm start
+Restart=on-failure
+RestartSec=5
+# Next.js server process — no extra capabilities needed since nginx handles :80/:443.
+NoNewPrivileges=true
+
+[Install]
+WantedBy=multi-user.target

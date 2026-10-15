@@ -1,0 +1,19 @@
+{
+  "expo": {
+    "name": "Qennect Chat Example",
+    "slug": "qennect-chat-example",
+    "version": "0.1.0",
+    "orientation": "default",
+    "userInterfaceStyle": "automatic",
+    "ios": {
+      "supportsTablet": true,
+      "googleServicesFile": "./GoogleService-Info.plist",
+      "infoPlist": { "UIBackgroundModes": ["remote-notification"] }
+    },
+    "android": {
+      "googleServicesFile": "./google-services.json"
+    },
+    "web": { "bundler": "metro" },
+    "plugins": ["@react-native-firebase/app", "@react-native-firebase/messaging"]
+  }
+}

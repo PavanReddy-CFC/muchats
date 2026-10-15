@@ -1,0 +1,12 @@
+{
+  "extends": ["../../.eslintrc.json"],
+  "parserOptions": {
+    "ecmaFeatures": { "jsx": true }
+  },
+  "env": {
+    "browser": true
+  },
+  "rules": {
+    "@typescript-eslint/no-unused-vars": ["warn", { "argsIgnorePattern": "^_", "varsIgnorePattern": "^React$" }]
+  }
+}

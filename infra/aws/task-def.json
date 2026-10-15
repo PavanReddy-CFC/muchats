@@ -1,0 +1,46 @@
+{
+  "family": "chat",
+  "networkMode": "awsvpc",
+  "requiresCompatibilities": ["FARGATE"],
+  "placementConstraints": [],
+  "cpu": "512",
+  "memory": "1024",
+  "executionRoleArn": "arn:aws:iam::654654534051:role/ecsTaskExecutionRole",
+  "containerDefinitions": [
+    {
+      "name": "chat",
+      "image": "654654534051.dkr.ecr.us-west-1.amazonaws.com/chat:latest",
+      "essential": true,
+      "portMappings": [
+        {
+          "containerPort": 9010,
+          "hostPort": 9010,
+          "protocol": "tcp"
+        }
+      ],
+      "environment": [
+        { "name": "PORT", "value": "9010" },
+        { "name": "API_PREFIX", "value": "chat-api" },
+        {
+          "name": "DATABASE_URL",
+          "value": "postgresql://postgres:qEnnect%231013%23@chat-dev-db.cxsawy4usapn.us-west-1.rds.amazonaws.com:5432/chats"
+        },
+        {
+          "name": "REDIS_URL",
+          "value": "redis://clustercfg.chat-staging-redis.oiceaz.usw1.cache.amazonaws.com:6379/0"
+        },
+        { "name": "JWT_ACCESS_SECRET", "value": "dev-access-secret-change-me-please-32chars" },
+        { "name": "JWT_REFRESH_SECRET", "value": "dev-refresh-secret-change-me-please-32chars" }
+      ],
+      "logConfiguration": {
+        "logDriver": "awslogs",
+        "options": {
+          "awslogs-group": "/ecs/chat",
+          "awslogs-region": "us-west-1",
+          "awslogs-stream-prefix": "api",
+          "awslogs-create-group": "true"
+        }
+      }
+    }
+  ]
+}
